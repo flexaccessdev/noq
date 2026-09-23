@@ -22,7 +22,6 @@ use std::{
 ))]
 use crate::runtime::default_runtime;
 use crate::{
-    Instant,
     runtime::{AsyncUdpSocket, Runtime, UdpSender},
     udp_transmit,
 };
@@ -459,9 +458,8 @@ impl Future for EndpointDriver {
             endpoint.driver = Some(cx.waker().clone());
         }
 
-        let now = endpoint.runtime.now();
         let mut keep_going = false;
-        keep_going |= endpoint.drive_recv(cx, now)?;
+        keep_going |= endpoint.drive_recv(cx)?;
         keep_going |= endpoint.handle_events(cx, &self.0.shared);
 
         if !endpoint.recv_state.incoming.is_empty() {
@@ -602,7 +600,7 @@ pub(crate) struct Shared {
 }
 
 impl State {
-    fn drive_recv(&mut self, cx: &mut Context<'_>, now: Instant) -> Result<bool, io::Error> {
+    fn drive_recv(&mut self, cx: &mut Context<'_>) -> Result<bool, io::Error> {
         let get_time = || self.runtime.now();
         self.recv_state.recv_limiter.start_cycle(get_time);
         if let Some(socket) = &mut self.prev_socket {
@@ -613,7 +611,6 @@ impl State {
                 &mut **socket,
                 &mut self.sender,
                 &*self.runtime,
-                now,
             );
             if poll_res.is_err() {
                 self.prev_socket = None;
@@ -625,7 +622,6 @@ impl State {
             &mut *self.socket,
             &mut self.sender,
             &*self.runtime,
-            now,
         );
         self.recv_state.recv_limiter.finish_cycle(get_time);
         let poll_res = poll_res?;
@@ -942,7 +938,6 @@ impl RecvState {
         socket: &mut dyn AsyncUdpSocket,
         sender: &mut Pin<Box<dyn UdpSender>>,
         runtime: &dyn Runtime,
-        now: Instant,
     ) -> Result<PollProgress, io::Error> {
         let mut received_connection_packet = false;
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
@@ -960,6 +955,13 @@ impl RecvState {
         loop {
             match socket.poll_recv(cx, &mut iovs, &mut metas) {
                 Poll::Ready(Ok(msgs)) => {
+                    // Stamp each batch as it is read, not once per driver poll:
+                    // a receive cycle can outlast a round trip (a preempted
+                    // thread, a long run of batches), and a datagram stamped
+                    // before it arrived can carry an ACK for a packet sent after
+                    // that stale instant, which yields a zero or far-too-small RTT
+                    // sample.
+                    let now = runtime.now();
                     self.recv_limiter.record_work(msgs);
                     // Copy the received batch into `datagrams` and split each datagram off as
                     // an owned slice. We can't read directly into `datagrams` and drop
