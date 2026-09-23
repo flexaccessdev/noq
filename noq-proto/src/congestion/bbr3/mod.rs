@@ -1678,7 +1678,19 @@ impl Bbr3 {
         {
             p.acknowledged = true;
             if let Some(mut rate_sample) = self.rs {
-                rate_sample.rtt = now - p.send_time;
+                // `Instant` subtraction saturates, so an ACK stamped no later than
+                // the packet's send time (clock skew, a stale receive timestamp)
+                // would read as a zero RTT, which the min-RTT filter then holds
+                // for `MIN_RTT_FILTER_LEN`, zeroing the BDP estimate. Keep the
+                // previous sample instead: the draft's `rs.rtt >= 0` check in
+                // `update_min_rtt` is meant to reject such a sample, but cannot
+                // with an unsigned `Duration`.
+                if let Some(rtt) = now
+                    .checked_duration_since(p.send_time)
+                    .filter(|rtt| !rtt.is_zero())
+                {
+                    rate_sample.rtt = rtt;
+                }
                 if is_newest_packet {
                     rate_sample.prior_delivered = p.delivered;
                     rate_sample.is_app_limited = p.is_app_limited;
@@ -2311,6 +2323,32 @@ mod test {
     /// `check_startup_high_loss` observes the high loss rate and ends STARTUP:
     /// `full_bw_now`/`full_bw_reached` become true and the flow transitions
     /// STARTUP -> DRAIN, purely from loss.
+    /// An ACK stamped no later than the send time of the packet it acknowledges
+    /// (a stale receive timestamp, say) must not become a zero min-RTT sample:
+    /// that zeroes the BDP estimate and leaves the window to the
+    /// ACK-aggregation term alone for the whole min-RTT filter window.
+    #[test]
+    fn ack_stamped_before_send_keeps_min_rtt() {
+        const MSS: u64 = 1200;
+        const RTT_NS: u64 = 300_000;
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        // One ordinary round trip sets the min RTT.
+        bbr.on_packet_sent(at(0), MSS as u16, 0, SpaceKind::Data);
+        bbr.on_ack(at(RTT_NS), at(0), MSS, 0, SpaceKind::Data, false, &rtt_est);
+        bbr.on_end_acks(at(RTT_NS), 0, false, Some(0), SpaceKind::Data);
+        assert_eq!(bbr.min_rtt, Duration::from_nanos(RTT_NS));
+
+        // The next packet's ACK carries a timestamp from before it was sent.
+        bbr.on_packet_sent(at(2 * RTT_NS), MSS as u16, 1, SpaceKind::Data);
+        bbr.on_ack(at(RTT_NS + 1), at(2 * RTT_NS), MSS, 1, SpaceKind::Data, false, &rtt_est);
+        bbr.on_end_acks(at(RTT_NS + 1), 0, false, Some(1), SpaceKind::Data);
+        assert_eq!(bbr.min_rtt, Duration::from_nanos(RTT_NS));
+    }
+
     #[test]
     fn startup_exits_to_drain_on_loss_when_app_limited() {
         /// packet size in bytes
