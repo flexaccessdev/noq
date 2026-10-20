@@ -226,6 +226,38 @@ impl UdpSocketState {
         send(self, socket.0, transmit)
     }
 
+    /// Sends a [`Transmit`] on a socket that is `connect(2)`ed to
+    /// `transmit.destination`, naming no destination in the message header.
+    ///
+    /// Apple only. XNU's `udp_output` connects and disconnects the protocol
+    /// control block around every `sendmsg` that names a destination: a route
+    /// lookup plus two rehashes of the global UDP PCB table under its lock, per
+    /// datagram. Measured on Apple silicon that is 25-40 µs per datagram, five
+    /// times the cost of the send itself, and `sendmsg_x` batching does not
+    /// amortize it. A socket connected to the peer skips all of it, so this is
+    /// the send a per-peer connected socket must use; with a destination in the
+    /// header a connected socket fails with `EISCONN` instead.
+    ///
+    /// The caller guarantees the socket is connected to `transmit.destination`.
+    /// Segmentation is not supported on Apple sockets, so `transmit` is one
+    /// datagram. Errors are handled as in [`UdpSocketState::send`].
+    #[cfg(apple)]
+    pub fn send_connected(
+        &self,
+        socket: UdpSockRef<'_>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<()> {
+        match send_single_inner(self, socket.0, transmit, false) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
+            Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => Ok(()),
+            Err(e) => {
+                log_sendmsg_error(&self.last_send_error, e, transmit);
+                Ok(())
+            }
+        }
+    }
+
     #[cfg(not(any(
         apple,
         target_os = "openbsd",
@@ -478,6 +510,19 @@ pub(crate) fn send_single(
     io: SockRef<'_>,
     transmit: &Transmit<'_>,
 ) -> io::Result<()> {
+    send_single_inner(state, io, transmit, true)
+}
+
+/// One `sendmsg` of `transmit`. With `name_destination` the message header
+/// carries `transmit.destination`; without it the kernel sends to the address
+/// the socket is `connect(2)`ed to (see [`UdpSocketState::send_connected`]).
+#[cfg(any(target_os = "openbsd", target_os = "netbsd", apple))]
+fn send_single_inner(
+    state: &UdpSocketState,
+    io: SockRef<'_>,
+    transmit: &Transmit<'_>,
+    name_destination: bool,
+) -> io::Result<()> {
     let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
     let mut iov: libc::iovec = unsafe { mem::zeroed() };
     let mut ctrl = cmsg::Aligned([0u8; cmsg::LEN]);
@@ -491,6 +536,10 @@ pub(crate) fn send_single(
         cfg!(apple) || cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd"),
         state.sendmsg_einval(),
     );
+    if !name_destination {
+        hdr.msg_name = std::ptr::null_mut();
+        hdr.msg_namelen = 0;
+    }
     retry_if_interrupted(|| unsafe { libc::sendmsg(io.as_raw_fd(), &hdr, 0) })?;
     Ok(())
 }
