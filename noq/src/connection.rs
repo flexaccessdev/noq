@@ -735,6 +735,43 @@ impl Connection {
             })
     }
 
+    /// Queue many unreliable, unordered application datagrams in a single call,
+    /// dropping none that are already queued.
+    ///
+    /// The non-evicting form of [`send_many_datagrams()`]: datagrams are queued
+    /// in order until the send buffer is full, then the call stops and returns
+    /// `Ok(n)` for the `n` queued, `Ok(0)` when not even the first fits. The
+    /// remainder is the caller's to retry once space frees up, for example by
+    /// awaiting [`send_datagram_wait()`] on the next one: a short batch marks
+    /// the connection blocked, so the driver signals when it frees space.
+    ///
+    /// The batch is rejected with [`SendDatagramError::TooLarge`] if any
+    /// datagram exceeds [`max_datagram_size()`](Self::max_datagram_size).
+    ///
+    /// [`send_many_datagrams()`]: Connection::send_many_datagrams
+    /// [`send_datagram_wait()`]: Connection::send_datagram_wait
+    pub fn try_send_many_datagrams(
+        &self,
+        datagrams: &[Bytes],
+    ) -> Result<usize, SendDatagramError> {
+        let conn = &mut *self.0.lock_and_wake("try_send_many_datagrams");
+        if let Some(ref x) = conn.error {
+            return Err(SendDatagramError::ConnectionLost(x.clone()));
+        }
+        conn.inner
+            .datagrams()
+            .send_many(datagrams, false)
+            .map_err(|e| {
+                use proto::SendDatagramError::*;
+                match e {
+                    Blocked(..) => unreachable!(),
+                    UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
+                    Disabled => SendDatagramError::Disabled,
+                    TooLarge => SendDatagramError::TooLarge,
+                }
+            })
+    }
+
     /// Transmit `data` as an unreliable, unordered application datagram
     ///
     /// Unlike [`send_datagram()`], this method will wait for buffer space during congestion
