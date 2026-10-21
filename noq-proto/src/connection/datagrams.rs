@@ -219,7 +219,15 @@ impl DatagramState {
     }
 
     fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
-        let Some(total) = self.outgoing.memory_used().checked_add(datagram_len) else {
+        // The new entry costs its payload plus its `Datagram` struct, exactly what
+        // `memory_used` will charge for it once queued (and what `received` charges an
+        // incoming datagram), so a full queue never exceeds `send_buffer_size`.
+        let Some(total) = self
+            .outgoing
+            .memory_used()
+            .checked_add(datagram_len)
+            .and_then(|total| total.checked_add(size_of::<Datagram>()))
+        else {
             return false;
         };
 
@@ -360,6 +368,25 @@ mod tests {
         assert_eq!(state.outgoing.queue.len(), 1);
         assert_eq!(state.outgoing.queue[0].data.len(), 2);
         assert_eq!(state.outgoing.payload_bytes, 2);
+    }
+
+    /// The send buffer bound includes each queued datagram's struct, so a datagram
+    /// fits exactly when payload plus struct equals the remaining space and not
+    /// one byte before.
+    #[test]
+    fn send_buffer_space_counts_the_new_datagram_struct() {
+        let mut state = DatagramState::default();
+        let entry = 5 + size_of::<Datagram>();
+
+        assert!(state.has_send_buffer_space(5, entry));
+        assert!(!state.has_send_buffer_space(5, entry - 1));
+
+        state.outgoing.push_back(Datagram {
+            data: Bytes::from_static(&[0; 5]),
+        });
+        assert_eq!(state.outgoing.memory_used(), entry);
+        assert!(state.has_send_buffer_space(5, 2 * entry));
+        assert!(!state.has_send_buffer_space(5, 2 * entry - 1));
     }
 
     #[test]
