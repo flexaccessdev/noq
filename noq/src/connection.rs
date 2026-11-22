@@ -260,7 +260,7 @@ impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let conn = &mut *self.0.lock_without_waking("poll");
+        let mut conn = self.0.lock_without_waking("poll");
 
         let span = debug_span!("drive", id = conn.handle.0);
         let _guard = span.enter();
@@ -269,7 +269,45 @@ impl Future for ConnectionDriver {
             conn.terminate(e, &self.0.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+
+        // Transmit with the connection unlocked across each socket send. The
+        // send is a syscall per transmit, the slowest step of the loop, and
+        // holding the lock across it makes every task that queues data for
+        // this connection wait out the sends of what it queued before. Only
+        // this task touches the sender, the send buffer and the buffered
+        // transmit, so they leave the state for the duration of the send.
+        let mut keep_going = false;
+        let now = conn.runtime.now();
+        let max_datagrams = conn
+            .sender
+            .max_transmit_segments()
+            .min(MAX_TRANSMIT_SEGMENTS);
+        let mut transmits = 0;
+        while let Some(t) = conn.next_transmit(now, max_datagrams, &mut transmits) {
+            let (mut sender, buffer) = conn.take_sender();
+            drop(conn);
+            let result = sender
+                .as_mut()
+                .poll_send(&udp_transmit(&t, &buffer[..t.size]), cx);
+            conn = self.0.lock_without_waking("poll");
+            conn.restore_sender(sender, buffer);
+            match result {
+                Poll::Pending => {
+                    conn.buffered_transmit = Some(t);
+                    break;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
+            if transmits >= MAX_TRANSMIT_DATAGRAMS {
+                // TODO: What isn't ideal here yet is that if we don't poll all
+                // datagrams that could be sent we don't go into the `app_limited`
+                // state and CWND continues to grow until we get here the next time.
+                // See https://github.com/quinn-rs/quinn/issues/1126
+                keep_going = true;
+                break;
+            }
+        }
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -289,6 +327,21 @@ impl Future for ConnectionDriver {
             unreachable!("drained connections always have an error");
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+/// Stands in for a connection's sender while the driver sends with the state
+/// unlocked. Nothing but the driver uses the sender, so it is never polled.
+#[derive(Debug)]
+struct TakenSender;
+
+impl UdpSender for TakenSender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        _transmit: &udp::Transmit<'_>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::other("connection sender is in use")))
     }
 }
 
@@ -1666,61 +1719,39 @@ impl State {
         }
     }
 
-    fn drive_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        let now = self.runtime.now();
-        let mut transmits = 0;
-
-        let max_datagrams = self
-            .sender
-            .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
-
-        loop {
-            // Retry the last transmit, or get a new one.
-            let t = match self.buffered_transmit.take() {
-                Some(t) => t,
-                None => {
-                    self.send_buffer.clear();
-                    match self
-                        .inner
-                        .poll_transmit(now, max_datagrams, &mut self.send_buffer)
-                    {
-                        Some(t) => {
-                            transmits += match t.segment_size {
-                                None => 1,
-                                Some(s) => t.size.div_ceil(s), // round up
-                            };
-                            t
-                        }
-                        None => break,
-                    }
-                }
-            };
-
-            let len = t.size;
-            match self
-                .sender
-                .as_mut()
-                .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
-            {
-                Poll::Pending => {
-                    self.buffered_transmit = Some(t);
-                    return Ok(false);
-                }
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Ready(Ok(())) => {}
-            }
-
-            if transmits >= MAX_TRANSMIT_DATAGRAMS {
-                // TODO: What isn't ideal here yet is that if we don't poll all
-                // datagrams that could be sent we don't go into the `app_limited`
-                // state and CWND continues to grow until we get here the next time.
-                // See https://github.com/quinn-rs/quinn/issues/1126
-                return Ok(true);
-            }
+    /// The transmit to send next: the one a blocked socket left buffered, or a
+    /// new one built into the send buffer. `transmits` counts the datagrams
+    /// of new transmits.
+    fn next_transmit(
+        &mut self,
+        now: Instant,
+        max_datagrams: NonZeroUsize,
+        transmits: &mut usize,
+    ) -> Option<proto::Transmit> {
+        if let Some(t) = self.buffered_transmit.take() {
+            return Some(t);
         }
+        self.send_buffer.clear();
+        let t = self
+            .inner
+            .poll_transmit(now, max_datagrams, &mut self.send_buffer)?;
+        *transmits += match t.segment_size {
+            None => 1,
+            Some(s) => t.size.div_ceil(s), // round up
+        };
+        Some(t)
+    }
 
-        Ok(false)
+    /// Take the sender and the send buffer out of the state, for a send made
+    /// with the state unlocked. [`Self::restore_sender`] puts them back.
+    fn take_sender(&mut self) -> (Pin<Box<dyn UdpSender>>, Vec<u8>) {
+        let sender = std::mem::replace(&mut self.sender, Box::pin(TakenSender));
+        (sender, std::mem::take(&mut self.send_buffer))
+    }
+
+    fn restore_sender(&mut self, sender: Pin<Box<dyn UdpSender>>, buffer: Vec<u8>) {
+        self.sender = sender;
+        self.send_buffer = buffer;
     }
 
     fn forward_endpoint_events(&mut self) {
