@@ -18,6 +18,15 @@ use crate::{Instant, TransportError, VarInt, frame, hash_map::Entry};
 /// Two is the margin other QUIC implementations judge by.
 const GROW_WITHIN_ROUND_TRIPS: u32 = 2;
 
+/// The shortest round trip a stream's reading is judged against
+///
+/// What a window has to cover is the delay between the reader taking data and the sender's next
+/// data arriving, and on a path of a fraction of a millisecond that is not the round trip: it
+/// is how late the receiving process runs. Judged against the path alone, no stream on such a
+/// path is ever fast enough to earn a larger window, and the sender stops for want of credit
+/// every time the receiver is a few milliseconds late.
+const MIN_GROWTH_ROUND_TRIP: Duration = Duration::from_millis(5);
+
 #[derive(Debug, Default)]
 pub(super) struct Recv {
     // NB: when adding or removing fields, remember to update `reinit`.
@@ -73,9 +82,9 @@ impl Recv {
     /// Called at `now` when a `MAX_STREAM_DATA` frame is about to be written for this stream,
     /// which happens every eighth of a window that is read. Once half a window has been read
     /// since the last judgement, the time that took is compared with `rtt`, the round-trip time
-    /// of the path the frame leaves on: under [`GROW_WITHIN_ROUND_TRIPS`] of them, the window
-    /// doubles, up to `max_window` and to what is left of `budget`. `base_window` is the
-    /// connection's `stream_receive_window`.
+    /// of the path the frame leaves on, or with [`MIN_GROWTH_ROUND_TRIP`] if that is longer:
+    /// under [`GROW_WITHIN_ROUND_TRIPS`] of them, the window doubles, up to `max_window` and to
+    /// what is left of `budget`. `base_window` is the connection's `stream_receive_window`.
     ///
     /// The next half window is timed from `now` either way, so a pause — an idle stream, a sender
     /// still getting up to speed — costs the one judgement it falls in.
@@ -100,7 +109,8 @@ impl Recv {
             return;
         }
         self.growth_epoch = Some((now, read));
-        if now.saturating_duration_since(since) >= rtt * GROW_WITHIN_ROUND_TRIPS {
+        let round_trip = rtt.max(MIN_GROWTH_ROUND_TRIP);
+        if now.saturating_duration_since(since) >= round_trip * GROW_WITHIN_ROUND_TRIPS {
             return;
         }
         let granted = window.min(max_window - window).min(*budget);
@@ -566,6 +576,7 @@ mod tests {
     struct Reader {
         recv: Box<Recv>,
         now: Instant,
+        rtt: Duration,
         budget: u64,
     }
 
@@ -575,6 +586,7 @@ mod tests {
             let mut reader = Self {
                 recv: Recv::new(BASE),
                 now: Instant::now(),
+                rtt: RTT,
                 budget,
             };
             reader.update();
@@ -601,7 +613,7 @@ mod tests {
 
         fn update(&mut self) {
             self.recv
-                .grow_window(self.now, RTT, BASE, MAX, &mut self.budget);
+                .grow_window(self.now, self.rtt, BASE, MAX, &mut self.budget);
         }
     }
 
@@ -624,6 +636,17 @@ mod tests {
         // A pause costs the one judgement it fell in: the next half window is timed from the
         // end of the last.
         assert_eq!(reader.read(BASE / 2, RTT), 2 * BASE);
+    }
+
+    #[test]
+    fn window_is_judged_against_no_less_than_the_minimum_round_trip() {
+        // A path of a fraction of a millisecond: what the window has to cover is how late the
+        // receiver runs, not the round trip.
+        let mut reader = Reader::new(u64::MAX);
+        reader.rtt = Duration::from_micros(300);
+        let limit = MIN_GROWTH_ROUND_TRIP * GROW_WITHIN_ROUND_TRIPS;
+        assert_eq!(reader.read(BASE / 2, limit / 2), 2 * BASE);
+        assert_eq!(reader.read(BASE, limit), 2 * BASE);
     }
 
     #[test]

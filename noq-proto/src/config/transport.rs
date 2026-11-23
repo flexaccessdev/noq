@@ -151,8 +151,10 @@ impl TransportConfig {
     /// With this set above `stream_receive_window`, a stream starts with that window and earns
     /// more: each time half its window has been read within two round trips, the application is
     /// keeping up with a sender the window is holding back, and the window doubles, up to this
-    /// value. A stream that is read slower than that, or not at all, keeps the window it has. A
-    /// window never shrinks again. What the streams of a connection take this way is limited by
+    /// value. A round trip counts as 5 ms at least, since on a shorter path it is the receiver's
+    /// own lateness the window has to cover. A stream that is read slower than that, or not at
+    /// all, keeps the window it has. A window never shrinks again. What the streams of a
+    /// connection take this way is limited by
     /// [`stream_receive_window_budget`](Self::stream_receive_window_budget), and `receive_window`
     /// bounds all of them together as it always does.
     ///
