@@ -2111,7 +2111,19 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 
 /// The maximum amount of datagrams that are sent in a single transmit
 ///
-/// This can be lower than the maximum platform capabilities, to avoid excessive
-/// memory allocations when calling `poll_transmit()`. Benchmarks have shown
-/// that numbers around 10 are a good compromise.
-const MAX_TRANSMIT_SEGMENTS: NonZeroUsize = NonZeroUsize::new(10).expect("known");
+/// A transmit is one send: one pass through the network stack, and one
+/// buffer to a NIC that segments UDP itself, shared by every datagram in it.
+/// Upstream stops at 10. Between two virtio Linux guests an IP tunnel moved
+/// 2.2 Gbit/s with batches of 10 and 3.0 with batches of 32 (1.8 and 2.0 with
+/// the NIC's UDP segmentation off), and a Windows client uploaded 1.3 and
+/// 1.6 Gbit/s. The pacer decides how much may leave at once either way; this
+/// only sets how many sends that takes.
+///
+/// A whole batch has to fit one UDP payload (65,507 bytes), or the send fails
+/// with `EMSGSIZE` and the batch is dropped, and a transport that frames it,
+/// like iroh's relay (about 65,500 bytes), must take it too: 32 datagrams
+/// fit at any MTU up to 2046, and MTU discovery stops at 1452 unless
+/// configured otherwise. Filling the payload exactly (about 45 datagrams)
+/// measured only 3-5% faster. The send buffer grows to 46 KB per connection,
+/// from 15.
+const MAX_TRANSMIT_SEGMENTS: NonZeroUsize = NonZeroUsize::new(32).expect("known");
