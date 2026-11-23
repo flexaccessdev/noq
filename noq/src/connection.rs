@@ -276,6 +276,7 @@ impl Future for ConnectionDriver {
         // this connection wait out the sends of what it queued before. Only
         // this task touches the sender, the send buffer and the buffered
         // transmit, so they leave the state for the duration of the send.
+        // Not on Windows, see `SEND_UNLOCKED`.
         let mut keep_going = false;
         let now = conn.runtime.now();
         let max_datagrams = conn
@@ -284,13 +285,18 @@ impl Future for ConnectionDriver {
             .min(MAX_TRANSMIT_SEGMENTS);
         let mut transmits = 0;
         while let Some(t) = conn.next_transmit(now, max_datagrams, &mut transmits) {
-            let (mut sender, buffer) = conn.take_sender();
-            drop(conn);
-            let result = sender
-                .as_mut()
-                .poll_send(&udp_transmit(&t, &buffer[..t.size]), cx);
-            conn = self.0.lock_without_waking("poll");
-            conn.restore_sender(sender, buffer);
+            let result = if SEND_UNLOCKED {
+                let (mut sender, buffer) = conn.take_sender();
+                drop(conn);
+                let result = sender
+                    .as_mut()
+                    .poll_send(&udp_transmit(&t, &buffer[..t.size]), cx);
+                conn = self.0.lock_without_waking("poll");
+                conn.restore_sender(sender, buffer);
+                result
+            } else {
+                conn.send_locked(&t, cx)
+            };
             match result {
                 Poll::Pending => {
                     conn.buffered_transmit = Some(t);
@@ -1742,6 +1748,13 @@ impl State {
         Some(t)
     }
 
+    /// Send a transmit built into the send buffer without leaving the state.
+    fn send_locked(&mut self, t: &proto::Transmit, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.sender
+            .as_mut()
+            .poll_send(&udp_transmit(t, &self.send_buffer[..t.size]), cx)
+    }
+
     /// Take the sender and the send buffer out of the state, for a send made
     /// with the state unlocked. [`Self::restore_sender`] puts them back.
     fn take_sender(&mut self) -> (Pin<Box<dyn UdpSender>>, Vec<u8>) {
@@ -2102,6 +2115,17 @@ pub enum SendDatagramError {
     #[error("connection lost")]
     ConnectionLost(#[from] ConnectionError),
 }
+
+/// Whether the connection driver releases the connection lock across each
+/// socket send.
+///
+/// Releasing it lets tasks that queue data for the connection run during the
+/// send, which is what an upload needs where every datagram is its own slow
+/// syscall (macOS). On Windows it cost a receiver instead: a tunnel client's
+/// download fell from 1.19 to 1.01 Gbit/s, its upload unchanged, so there
+/// the lock is held across the send as upstream does. Between Linux hosts
+/// both measured alike.
+const SEND_UNLOCKED: bool = !cfg!(windows);
 
 /// The maximum amount of datagrams which will be produced in a single `drive_transmit` call
 ///
