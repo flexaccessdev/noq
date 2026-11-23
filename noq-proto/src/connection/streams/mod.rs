@@ -161,6 +161,9 @@ impl RecvStream<'_> {
         let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
 
         let (read_credits, stop_sending) = stream.stop()?;
+        // A stopped stream buffers nothing further, so what its window grew by is free for
+        // other streams from here on, whenever the peer gets around to ending it.
+        let released_window = stream.release_window();
         if stop_sending.should_transmit() {
             self.pending.stop_sending.push(frame::StopSending {
                 id: self.id,
@@ -176,6 +179,7 @@ impl RecvStream<'_> {
             self.state.stream_recv_freed(self.id, recv);
         }
 
+        self.state.return_stream_window(released_window);
         if self.state.add_read_credits(read_credits).should_transmit() {
             self.pending.max_data = true;
         }

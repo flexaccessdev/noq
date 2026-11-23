@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
-use core::{convert::TryFrom, mem};
+use core::{convert::TryFrom, mem, time::Duration};
 
 use tracing::{debug, trace};
 
@@ -8,7 +8,7 @@ use super::{
     StreamHalf,
 };
 use crate::{
-    Dir, FxHashMap, MAX_STREAM_COUNT, PathId, Side, StreamId, TransportError, VarInt,
+    Dir, FxHashMap, Instant, MAX_STREAM_COUNT, PathId, Side, StreamId, TransportError, VarInt,
     connection::{PacketBuilder, paths::PathIdKey, stats::FrameStats},
     frame::{self, FrameStruct},
     hash_map,
@@ -124,8 +124,14 @@ pub struct StreamsState {
     ///
     /// Note this may be less than `unacked_data` if the user has set a new value.
     pub(super) send_window: u64,
-    /// Configured upper bound for how much unacked data the peer can send us per stream
+    /// How much unacked data the peer can send us per stream, for a stream whose window has not
+    /// grown
     pub(super) stream_receive_window: u64,
+    /// The most a stream's receive window grows to; no stream's does unless this is above
+    /// `stream_receive_window`
+    max_stream_receive_window: u64,
+    /// What is left for streams to grow their receive windows with, between them
+    stream_window_budget: u64,
 
     // Pertinent state from the TransportParameters supplied by the peer
     initial_max_stream_data_uni: VarInt,
@@ -176,12 +182,29 @@ impl StreamsState {
             unacked_data: 0,
             send_window,
             stream_receive_window: stream_receive_window.into(),
+            max_stream_receive_window: 0,
+            stream_window_budget: 0,
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
             streams_blocked: [false, false],
         }
+    }
+
+    /// Let each stream's receive window grow from `stream_receive_window` up to
+    /// `max_stream_receive_window` while its reader keeps up, with `budget` bytes for all of them
+    /// to grow by (see [`TransportConfig::max_stream_receive_window`])
+    ///
+    /// [`TransportConfig::max_stream_receive_window`]: crate::TransportConfig::max_stream_receive_window
+    pub(crate) fn with_stream_window_growth(
+        mut self,
+        max_stream_receive_window: VarInt,
+        budget: u64,
+    ) -> Self {
+        self.max_stream_receive_window = max_stream_receive_window.into();
+        self.stream_window_budget = budget;
+        self
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
@@ -218,8 +241,12 @@ impl StreamsState {
                 // counters below.
                 let id = StreamId::new(self.side, dir, i);
                 self.send.remove(&id).unwrap();
-                if let Dir::Bi = dir {
-                    self.recv.remove(&id).unwrap();
+                if let Dir::Bi = dir
+                    && let Some(mut recv) = self.recv.remove(&id).unwrap()
+                    && let Some(rs) = recv.as_open_recv_mut()
+                {
+                    let released = rs.release_window();
+                    self.return_stream_window(released);
                 }
             }
             self.next[dir as usize] = 0;
@@ -430,6 +457,8 @@ impl StreamsState {
         builder: &mut PacketBuilder<'a, 'b>,
         pending: &mut Retransmits,
         stats: &mut FrameStats,
+        now: Instant,
+        rtt: Duration,
     ) {
         // RESET_STREAM
         while builder.frame_space_remaining() > frame::ResetStream::SIZE_BOUND {
@@ -500,6 +529,15 @@ impl StreamsState {
                 continue;
             }
 
+            // The stream has read enough for an update: the moment to judge whether it is read
+            // fast enough to be given a larger window, which this frame then announces.
+            rs.grow_window(
+                now,
+                rtt,
+                self.stream_receive_window,
+                self.max_stream_receive_window,
+                &mut self.stream_window_budget,
+            );
             let (max, _) = rs.max_stream_data(self.stream_receive_window);
             rs.record_sent_max_stream_data(max);
             builder.write_frame(frame::MaxStreamData { id, offset: max }, stats);
@@ -944,7 +982,16 @@ impl StreamsState {
         }
     }
 
-    pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
+    /// Put back what a stream's receive window had grown by, for other streams to grow with
+    pub(super) fn return_stream_window(&mut self, released: u64) {
+        self.stream_window_budget = self.stream_window_budget.saturating_add(released);
+    }
+
+    pub(super) fn stream_recv_freed(&mut self, id: StreamId, mut recv: StreamRecv) {
+        if let Some(rs) = recv.as_open_recv_mut() {
+            let released = rs.release_window();
+            self.return_stream_window(released);
+        }
         self.free_recv.push(recv.free(self.stream_receive_window));
         self.stream_freed(id, StreamHalf::Recv);
     }

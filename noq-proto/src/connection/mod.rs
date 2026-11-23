@@ -422,6 +422,10 @@ impl Connection {
                 config.send_window,
                 config.receive_window,
                 config.stream_receive_window,
+            )
+            .with_stream_window_growth(
+                config.max_stream_receive_window,
+                config.stream_receive_window_budget,
             ),
             datagrams: DatagramState::default(),
             config,
@@ -6471,8 +6475,10 @@ impl Connection {
             && scheduling_info.can_send_data
             && scheduling_info.status_allows_data
         {
+            // What a stream's receive window is judged against, when it has room to grow.
+            let rtt = self.paths.get(&path_id).expect("known path").data.rtt.get();
             self.streams
-                .write_control_frames(builder, &mut space.pending, stats);
+                .write_control_frames(builder, &mut space.pending, stats, now, rtt);
         }
 
         // NEW_CONNECTION_ID

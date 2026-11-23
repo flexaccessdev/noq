@@ -34,6 +34,8 @@ pub struct TransportConfig {
     pub(crate) max_concurrent_uni_streams: VarInt,
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
+    pub(crate) max_stream_receive_window: VarInt,
+    pub(crate) stream_receive_window_budget: u64,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
 
@@ -129,8 +131,50 @@ impl TransportConfig {
     /// stream doesn't monopolize receive buffers, which may otherwise occur if the application
     /// chooses not to read from a large stream for a time while still requiring data on other
     /// streams.
+    ///
+    /// With [`max_stream_receive_window`](Self::max_stream_receive_window) set above this, it is
+    /// the window every stream starts with rather than the one it keeps.
     pub fn stream_receive_window(&mut self, value: VarInt) -> &mut Self {
         self.stream_receive_window = value;
+        self
+    }
+
+    /// The most a stream's receive window may grow to, from the `stream_receive_window` it starts
+    /// with.
+    ///
+    /// A stream carries at most one receive window per round trip, so a bulk transfer over a long
+    /// path wants a large one. But the window is also what a stream buffers when the application
+    /// reads it slower than the path delivers, and flow control credit cannot be withdrawn once
+    /// issued: a window large enough for the bulk transfer, given to every stream from the start,
+    /// is memory every stalled stream can be made to fill.
+    ///
+    /// With this set above `stream_receive_window`, a stream starts with that window and earns
+    /// more: each time half its window has been read within two round trips, the application is
+    /// keeping up with a sender the window is holding back, and the window doubles, up to this
+    /// value. A stream that is read slower than that, or not at all, keeps the window it has. A
+    /// window never shrinks again. What the streams of a connection take this way is limited by
+    /// [`stream_receive_window_budget`](Self::stream_receive_window_budget), and `receive_window`
+    /// bounds all of them together as it always does.
+    ///
+    /// Defaults to zero: every stream keeps `stream_receive_window`.
+    pub fn max_stream_receive_window(&mut self, value: VarInt) -> &mut Self {
+        self.max_stream_receive_window = value;
+        self
+    }
+
+    /// How many bytes the streams of a connection may hold between them beyond
+    /// `stream_receive_window` each, when
+    /// [`max_stream_receive_window`](Self::max_stream_receive_window) lets their windows grow.
+    ///
+    /// Growth is taken out of this budget and returned when the stream ends or is stopped. A
+    /// stream the budget has nothing left for keeps the window it has, and so keeps receiving:
+    /// unlike `receive_window`, this is not credit that streams share, and a stream that holds a
+    /// large window without reading it takes nothing from the others. Worst-case memory use of a
+    /// connection is then `stream_receive_window` for each concurrent stream, plus this.
+    ///
+    /// Defaults to no limit.
+    pub fn stream_receive_window_budget(&mut self, value: u64) -> &mut Self {
+        self.stream_receive_window_budget = value;
         self
     }
 
@@ -576,6 +620,8 @@ impl Default for TransportConfig {
             // 30 second default recommended by RFC 9308 § 3.2
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
+            max_stream_receive_window: VarInt::from_u32(0),
+            stream_receive_window_budget: u64::MAX,
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
 
@@ -629,6 +675,8 @@ impl fmt::Debug for TransportConfig {
             max_concurrent_uni_streams,
             max_idle_timeout,
             stream_receive_window,
+            max_stream_receive_window,
+            stream_receive_window_budget,
             receive_window,
             send_window,
             packet_threshold,
@@ -667,6 +715,8 @@ impl fmt::Debug for TransportConfig {
             .field("max_concurrent_uni_streams", max_concurrent_uni_streams)
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
+            .field("max_stream_receive_window", max_stream_receive_window)
+            .field("stream_receive_window_budget", stream_receive_window_budget)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
             .field("packet_threshold", packet_threshold)

@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use core::mem;
+use core::{mem, time::Duration};
 
 use thiserror::Error;
 use tracing::debug;
@@ -8,7 +8,15 @@ use super::state::get_or_insert_recv;
 use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::connection::streams::state::StreamRecv;
-use crate::{TransportError, VarInt, frame, hash_map::Entry};
+use crate::{Instant, TransportError, VarInt, frame, hash_map::Entry};
+
+/// A stream's receive window doubles when half of it was read in under this many round trips
+///
+/// A sender held back by the window delivers one window per round trip, so half takes about half
+/// of one. A reader or a path that sets the pace instead takes longer, the sooner the further the
+/// window is from mattering: growth stops at four to eight times what the stream's rate needs.
+/// Two is the margin other QUIC implementations judge by.
+const GROW_WITHIN_ROUND_TRIPS: u32 = 2;
 
 #[derive(Debug, Default)]
 pub(super) struct Recv {
@@ -22,6 +30,14 @@ pub(super) struct Recv {
     ///
     /// Credit for data that is read is issued by [`Chunks::finalize`] instead.
     unread_credit: u64,
+    /// Receive window this stream holds beyond the connection's `stream_receive_window`
+    ///
+    /// Taken out of the connection's budget by [`Self::grow_window`], and returned to it by
+    /// whoever calls [`Self::release_window`].
+    extra_window: u64,
+    /// When the stretch of reading that [`Self::grow_window`] is timing began, and how much had
+    /// been read by then
+    growth_epoch: Option<(Instant, u64)>,
 }
 
 impl Recv {
@@ -33,6 +49,8 @@ impl Recv {
             end: 0,
             stopped: false,
             unread_credit: 0,
+            extra_window: 0,
+            growth_epoch: None,
         })
     }
 
@@ -44,6 +62,59 @@ impl Recv {
         self.end = 0;
         self.stopped = false;
         self.unread_credit = 0;
+        debug_assert_eq!(self.extra_window, 0, "window not returned to the budget");
+        self.extra_window = 0;
+        self.growth_epoch = None;
+    }
+
+    /// Widen this stream's receive window if its reader keeps up with a sender the window is
+    /// holding back
+    ///
+    /// Called at `now` when a `MAX_STREAM_DATA` frame is about to be written for this stream,
+    /// which happens every eighth of a window that is read. Once half a window has been read
+    /// since the last judgement, the time that took is compared with `rtt`, the round-trip time
+    /// of the path the frame leaves on: under [`GROW_WITHIN_ROUND_TRIPS`] of them, the window
+    /// doubles, up to `max_window` and to what is left of `budget`. `base_window` is the
+    /// connection's `stream_receive_window`.
+    ///
+    /// The next half window is timed from `now` either way, so a pause — an idle stream, a sender
+    /// still getting up to speed — costs the one judgement it falls in.
+    pub(super) fn grow_window(
+        &mut self,
+        now: Instant,
+        rtt: Duration,
+        base_window: u64,
+        max_window: u64,
+        budget: &mut u64,
+    ) {
+        let window = base_window + self.extra_window;
+        if window >= max_window {
+            return;
+        }
+        let read = self.assembler.bytes_read();
+        let Some((since, read_then)) = self.growth_epoch else {
+            self.growth_epoch = Some((now, read));
+            return;
+        };
+        if read - read_then < window / 2 {
+            return;
+        }
+        self.growth_epoch = Some((now, read));
+        if now.saturating_duration_since(since) >= rtt * GROW_WITHIN_ROUND_TRIPS {
+            return;
+        }
+        let granted = window.min(max_window - window).min(*budget);
+        *budget -= granted;
+        self.extra_window += granted;
+    }
+
+    /// Give up the receive window this stream holds beyond the connection's
+    /// `stream_receive_window`, for the caller to return to the connection's budget
+    ///
+    /// For a stream that will buffer nothing further: one that has ended or was stopped.
+    pub(super) fn release_window(&mut self) -> u64 {
+        self.growth_epoch = None;
+        mem::take(&mut self.extra_window)
     }
 
     /// Process a STREAM frame
@@ -116,8 +187,15 @@ impl Recv {
     /// transmission of the value is recommended. If the boolean value is
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
+    ///
+    /// `stream_receive_window` is the connection's; this stream's own window is that plus
+    /// whatever [`Self::grow_window`] has added to it.
     pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
-        let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
+        let stream_receive_window = stream_receive_window + self.extra_window;
+        // A stopped stream has given its extra window up, so what it announced earlier may be
+        // ahead of this; it sends no further updates either way.
+        let max_stream_data =
+            (self.assembler.bytes_read() + stream_receive_window).max(self.sent_max_stream_data);
 
         // Only announce a window update if it's significant enough
         // to make it worthwhile sending a MAX_STREAM_DATA frame.
@@ -471,11 +549,119 @@ impl Default for RecvState {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use bytes::Bytes;
 
     use crate::{Dir, Side};
 
     use super::*;
+
+    const BASE: u64 = 1000;
+    const MAX: u64 = 8 * BASE;
+    const RTT: Duration = Duration::from_millis(50);
+
+    /// A stream's reader and the clock it reads by, with [`Recv::grow_window`] called as it is
+    /// when a `MAX_STREAM_DATA` frame goes out
+    struct Reader {
+        recv: Box<Recv>,
+        now: Instant,
+        budget: u64,
+    }
+
+    impl Reader {
+        /// A stream whose first window update has gone out, which is where the timing starts
+        fn new(budget: u64) -> Self {
+            let mut reader = Self {
+                recv: Recv::new(BASE),
+                now: Instant::now(),
+                budget,
+            };
+            reader.update();
+            reader
+        }
+
+        fn window(&self) -> u64 {
+            BASE + self.recv.extra_window
+        }
+
+        /// Read `bytes` more over `took`, then send a window update
+        fn read(&mut self, bytes: u64, took: Duration) -> u64 {
+            let offset = self.recv.assembler.bytes_read();
+            let data = Bytes::from(vec![0; bytes as usize]);
+            self.recv
+                .assembler
+                .insert(offset, data, bytes as usize)
+                .unwrap();
+            while self.recv.assembler.read(usize::MAX, true).is_some() {}
+            self.now += took;
+            self.update();
+            self.window()
+        }
+
+        fn update(&mut self) {
+            self.recv
+                .grow_window(self.now, RTT, BASE, MAX, &mut self.budget);
+        }
+    }
+
+    #[test]
+    fn window_doubles_while_its_reader_keeps_up() {
+        let mut reader = Reader::new(u64::MAX);
+        // A sender the window holds back delivers half of it in half a round trip.
+        assert_eq!(reader.read(BASE / 2, RTT / 2), 2 * BASE);
+        assert_eq!(reader.read(BASE, RTT / 2), 4 * BASE);
+        assert_eq!(reader.read(2 * BASE, RTT / 2), MAX);
+        assert_eq!(reader.read(4 * BASE, RTT / 2), MAX, "at the maximum");
+    }
+
+    #[test]
+    fn window_stays_for_a_slow_or_stalled_reader() {
+        let mut reader = Reader::new(u64::MAX);
+        // Exactly two round trips is not under two.
+        assert_eq!(reader.read(BASE / 2, 2 * RTT), BASE);
+        assert_eq!(reader.read(BASE / 2, Duration::from_secs(60)), BASE);
+        // A pause costs the one judgement it fell in: the next half window is timed from the
+        // end of the last.
+        assert_eq!(reader.read(BASE / 2, RTT), 2 * BASE);
+    }
+
+    #[test]
+    fn window_is_judged_by_the_half() {
+        let mut reader = Reader::new(u64::MAX);
+        // Updates go out every eighth of a window; none of them counts until half was read.
+        assert_eq!(reader.read(BASE / 4, RTT / 4), BASE);
+        assert_eq!(reader.read(BASE / 4 - 1, RTT / 4), BASE);
+        assert_eq!(reader.read(1, RTT / 4), 2 * BASE);
+        // And the whole of that half is timed, not its last update.
+        assert_eq!(reader.read(BASE / 2, RTT), 2 * BASE);
+        assert_eq!(reader.read(BASE / 2, RTT), 2 * BASE, "two, not under two");
+    }
+
+    #[test]
+    fn window_grows_out_of_the_budget_and_returns_to_it() {
+        let mut reader = Reader::new(BASE + BASE / 2);
+        assert_eq!(reader.read(BASE / 2, RTT / 2), 2 * BASE);
+        assert_eq!(reader.budget, BASE / 2);
+        // The next doubling gets what is left, and the one after that nothing.
+        assert_eq!(reader.read(BASE, RTT / 2), 2 * BASE + BASE / 2);
+        assert_eq!(reader.read(2 * BASE, RTT / 2), 2 * BASE + BASE / 2);
+        assert_eq!(reader.budget, 0);
+
+        // The grown window is what the stream announces.
+        let read = reader.recv.assembler.bytes_read();
+        let (max, transmit) = reader.recv.max_stream_data(BASE);
+        assert_eq!(max, read + 2 * BASE + BASE / 2);
+        assert!(transmit.should_transmit());
+        reader.recv.record_sent_max_stream_data(max);
+
+        // Giving the window up takes back no credit that was announced.
+        assert_eq!(reader.recv.release_window(), BASE + BASE / 2);
+        assert_eq!(reader.recv.release_window(), 0, "given up once");
+        let (max_after, transmit) = reader.recv.max_stream_data(BASE);
+        assert_eq!(max_after, max);
+        assert!(!transmit.should_transmit());
+    }
 
     #[test]
     fn reordered_frames_while_stopped() {
