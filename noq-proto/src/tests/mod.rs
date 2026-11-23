@@ -28,8 +28,8 @@ use crate::{
     AckFrequencyConfig, ApplicationClose, ClientConfig, Connection, ConnectionClose,
     ConnectionError, ConnectionEvent, ConnectionHandle, ConnectionId, DEFAULT_SUPPORTED_VERSIONS,
     Datagram, DatagramEvent, Dir, Duration, EcnCodepoint, Endpoint, EndpointConfig, Event,
-    FinishError, FourTuple, HashedConnectionIdGenerator, INITIAL_MTU, Instant, MIN_INITIAL_SIZE,
-    PathEvent, PathId, PathStatus, ReadError, ReadableError, RecvStream, SendDatagramError,
+    FinishError, FourTuple, HashedConnectionIdGenerator, INITIAL_MTU, Instant, MAX_GSO_BATCH_SIZE,
+    MIN_INITIAL_SIZE, PathEvent, PathId, PathStatus, ReadError, ReadableError, RecvStream, SendDatagramError,
     ServerConfig,
     Side::*,
     StreamEvent, Transmit, TransportConfig, TransportError, TransportErrorCode, VarInt, WriteError,
@@ -5054,6 +5054,53 @@ fn send_quantum_bounds_the_gso_batch() {
     assert!(
         datagrams <= QUANTUM_DATAGRAMS,
         "batched {datagrams} datagrams, over the {QUANTUM_DATAGRAMS} the send quantum allows"
+    );
+}
+
+/// A GSO batch is one UDP send, so however many datagrams the caller accepts, a batch stops at
+/// what a single UDP payload holds.
+#[test]
+fn gso_batch_fits_one_udp_send() {
+    /// As many segments as Linux takes in one send (`UDP_MAX_SEGMENTS`): at the MTU, more
+    /// than fit one UDP payload.
+    const MAX_DATAGRAMS: NonZeroUsize = NonZeroUsize::new(64).expect("non zero");
+
+    let _guard = subscribe();
+
+    // Neither the window, the pacer nor the send quantum bounds the batch.
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(FixedQuantumController {
+        send_quantum: 1 << 20,
+    }));
+    let mut client_cfg = client_config();
+    client_cfg.transport = Arc::new(transport);
+
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(client_cfg);
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s)
+        .write(&[42; 256 * 1024])
+        .unwrap();
+
+    let now = pair.time;
+    let mut buf = Vec::new();
+    let transmit = pair
+        .client_conn_mut(client_ch)
+        .poll_transmit(now, MAX_DATAGRAMS, &mut buf)
+        .expect("a stream write must produce a transmit");
+
+    let segment_size = transmit
+        .segment_size
+        .expect("more than one datagram was written");
+    assert!(
+        segment_size * MAX_DATAGRAMS.get() > MAX_GSO_BATCH_SIZE,
+        "{segment_size}-byte segments are too small to test the bound"
+    );
+    assert_eq!(
+        transmit.size,
+        MAX_GSO_BATCH_SIZE / segment_size * segment_size,
+        "a batch holds as many {segment_size}-byte segments as fit one UDP payload"
     );
 }
 

@@ -25,8 +25,8 @@ use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
     Dir, Duration, EndpointConfig, FourTuple, Frame, FxHashMap, INITIAL_MTU, Instant, MAX_CID_SIZE,
-    MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
-    TransportError, TransportErrorCode, VarInt,
+    MAX_GSO_BATCH_SIZE, MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY,
+    TokenStore, Transmit, TransportError, TransportErrorCode, VarInt,
     cid_queue::CidQueue,
     config::{ServerConfig, TransportConfig},
     congestion::Controller,
@@ -1358,7 +1358,12 @@ impl Connection {
         };
 
         // Set the segment size to this path's MTU for on-path data.
-        let pmtu = path.current_mtu().into();
+        let pmtu: usize = path.current_mtu().into();
+        // The batch is handed to the socket as one send, which fails with more than a UDP
+        // payload's worth however many segments the socket supports. Datagrams are at most
+        // the MTU, so this many always fit.
+        let max_datagrams = max_datagrams
+            .min(NonZeroUsize::new(MAX_GSO_BATCH_SIZE / pmtu).unwrap_or(NonZeroUsize::MIN));
         let mut transmit = TransmitBuf::new(buf, max_datagrams, pmtu);
 
         // Iterate over the available spaces.

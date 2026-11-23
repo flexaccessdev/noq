@@ -406,6 +406,11 @@ const MIN_INITIAL_SIZE: u16 = 1200;
 /// <https://www.rfc-editor.org/rfc/rfc9000.html#name-datagram-size>
 const INITIAL_MTU: u16 = 1200;
 const MAX_UDP_PAYLOAD: u16 = 65527;
+/// Largest payload of one UDP send over IPv4: 65,535 less the IPv4 and UDP headers.
+///
+/// A GSO batch leaves as a single send, so this bounds its size on either address family
+/// (IPv6 allows 20 bytes more).
+const MAX_GSO_BATCH_SIZE: usize = 65_507;
 const TIMER_GRANULARITY: Duration = Duration::from_millis(1);
 /// Maximum number of streams that can be uniquely identified by a stream ID
 const MAX_STREAM_COUNT: u64 = 1 << 60;

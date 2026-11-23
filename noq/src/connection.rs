@@ -2144,10 +2144,11 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// only sets how many sends that takes.
 ///
 /// A whole batch has to fit one UDP payload (65,507 bytes), or the send fails
-/// with `EMSGSIZE` and the batch is dropped, and a transport that frames it,
-/// like iroh's relay (about 65,500 bytes), must take it too: 32 datagrams
-/// fit at any MTU up to 2046, and MTU discovery stops at 1452 unless
-/// configured otherwise. Filling the payload exactly (about 45 datagrams)
-/// measured only 3-5% faster. The send buffer grows to 46 KB per connection,
-/// from 15.
+/// with `EMSGSIZE` and the batch is dropped. `poll_transmit` bounds a batch
+/// in bytes for that, which only takes effect at an MTU above 2046: MTU
+/// discovery stops at 1452 unless configured otherwise. A transport that
+/// frames a batch, like iroh's relay (about 65,500 bytes), must take it too,
+/// which 32 datagrams of up to 2046 bytes also satisfy. Filling the payload
+/// exactly (about 45 datagrams) measured only 3-5% faster. The send buffer
+/// grows to 46 KB per connection, from 15.
 const MAX_TRANSMIT_SEGMENTS: NonZeroUsize = NonZeroUsize::new(32).expect("known");
