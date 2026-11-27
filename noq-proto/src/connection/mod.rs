@@ -37,7 +37,7 @@ use crate::{
         stats::PathStatsMap,
         timer::{ConnTimer, PathTimer},
     },
-    crypto::{self, Keys},
+    crypto::{self, DeferredSeal, Keys},
     frame::{
         self, Close, DataBlocked, Datagram, FrameStruct, NewToken, ObservedAddr, StreamDataBlocked,
         StreamsBlocked,
@@ -311,6 +311,11 @@ pub struct Connection {
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
     qlog: QlogSink,
+    /// Whether 1-RTT packets are left for the caller to protect, see
+    /// [`Self::set_deferred_seal`].
+    deferred_seal: bool,
+    /// The packets of the last transmit that still need protecting.
+    deferred_seals: Vec<DeferredSeal>,
 }
 
 impl Connection {
@@ -440,6 +445,8 @@ impl Connection {
 
             n0_nat_traversal: Default::default(),
             qlog,
+            deferred_seal: false,
+            deferred_seals: Vec::new(),
         };
         if path_validated {
             this.on_path_validated(PathId::ZERO);
@@ -1030,6 +1037,25 @@ impl Connection {
         &mut path.data
     }
 
+    /// Leave the protection of 1-RTT packets to the caller
+    ///
+    /// When enabled, [`Self::poll_transmit`] writes 1-RTT packets to the buffer in the
+    /// clear and records what protects each one. The caller takes those records with
+    /// [`Self::take_deferred_seals`] after every transmit and applies them to the buffer
+    /// before sending it, which it can do without holding the connection. Packets of the
+    /// other encryption levels are protected as they are written.
+    pub fn set_deferred_seal(&mut self, enabled: bool) {
+        debug_assert!(self.deferred_seals.is_empty());
+        self.deferred_seal = enabled;
+    }
+
+    /// Move the pending protection of the last transmit's packets into `seals`
+    ///
+    /// `seals` is appended to, in the order the packets were written.
+    pub fn take_deferred_seals(&mut self, seals: &mut Vec<DeferredSeal>) {
+        seals.append(&mut self.deferred_seals);
+    }
+
     /// Returns packets to transmit
     ///
     /// Connections should be polled for transmit after:
@@ -1039,6 +1065,9 @@ impl Connection {
     ///
     /// `max_datagrams` specifies how many datagrams can be returned inside a
     /// single Transmit using GSO. This must be at least 1.
+    ///
+    /// With [`Self::set_deferred_seal`] the 1-RTT packets of the transmit are written in
+    /// the clear, and [`Self::take_deferred_seals`] must follow every call that returns one.
     #[must_use]
     pub fn poll_transmit(
         &mut self,
@@ -1050,6 +1079,12 @@ impl Connection {
             false => NonZeroUsize::MIN,
             true => max_datagrams,
         };
+        // What is recorded from here on belongs to this call's buffer.
+        debug_assert!(
+            self.deferred_seals.is_empty(),
+            "the deferred seals of the previous transmit were not taken"
+        );
+        self.deferred_seals.clear();
 
         // Each call to poll_transmit can only send datagrams to one destination, because
         // all datagrams in a GSO batch are for the same destination.  Therefore only

@@ -7,6 +7,7 @@ use crate::{
     ConnectionId, FrameStats, Instant, MIN_INITIAL_SIZE, TransportError,
     coding::Encodable,
     connection::{ConnectionSide, EncryptionLevel, qlog::QlogSentPacket, spaces::Retransmits},
+    crypto::DeferredSeal,
     frame::EncodableFrame,
     packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
 };
@@ -361,13 +362,32 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
 
         self.buf.put_bytes(0, packet_crypto.tag_len());
         let encode_start = self.partial_encode.start;
+        let encode_end = self.buf.len();
         let packet_buf = &mut self.buf.as_mut_slice()[encode_start..];
-        // for packet protection, PathId::ZERO and no path are equivalent.
-        self.partial_encode.finish(
-            packet_buf,
-            header_crypto,
-            Some((self.packet_number, self.path, packet_crypto)),
-        );
+        if conn.deferred_seal && self.level == EncryptionLevel::OneRtt {
+            // The caller protects the packet, with the keys current as it is built: a
+            // later key update must not reach it.
+            if let Some((header_len, pn_pos)) = self.partial_encode.finish_unprotected(packet_buf) {
+                let (header_key, packet_key) = conn.crypto_state.shared_local_1rtt();
+                conn.deferred_seals.push(DeferredSeal {
+                    start: encode_start,
+                    end: encode_end,
+                    header_len,
+                    pn_pos,
+                    packet_number: self.packet_number,
+                    path_id: self.path,
+                    header_key,
+                    packet_key,
+                });
+            }
+        } else {
+            // for packet protection, PathId::ZERO and no path are equivalent.
+            self.partial_encode.finish(
+                packet_buf,
+                header_crypto,
+                Some((self.packet_number, self.path, packet_crypto)),
+            );
+        }
 
         conn.crypto_state.inc_sent_with_keys(self.level);
 

@@ -1,4 +1,4 @@
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use core::{
     mem,
     ops::{Index, IndexMut},
@@ -133,6 +133,12 @@ pub(super) struct CryptoState {
     pub(super) key_phase: bool,
     /// How many packets are in the current key phase. Used only for `Data` space.
     pub(super) key_phase_size: u64,
+    /// The local 1-RTT keys as shared handles, once a deferred seal has asked for them.
+    ///
+    /// The keys in `spaces` then forward to these. A key update replaces the packet key, so
+    /// it clears that handle; the header key lasts the connection.
+    shared_local_header: Option<Arc<dyn HeaderKey>>,
+    shared_local_packet: Option<Arc<dyn PacketKey>>,
 }
 
 impl CryptoState {
@@ -164,7 +170,42 @@ impl CryptoState {
             // response. Inspired by quic-go's similar behavior of performing the first key update
             // at the 100th short-header packet.
             key_phase_size: rng.random_range(10..1000),
+            shared_local_header: None,
+            shared_local_packet: None,
         }
+    }
+
+    /// The local 1-RTT keys as handles that outlive the borrow of the connection.
+    ///
+    /// PANICS: If 1-RTT keys are missing.
+    pub(super) fn shared_local_1rtt(&mut self) -> (Arc<dyn HeaderKey>, Arc<dyn PacketKey>) {
+        let keys = self.spaces[2]
+            .keys
+            .as_mut()
+            .expect("1-RTT keys are installed");
+        let header = self
+            .shared_local_header
+            .get_or_insert_with(|| {
+                let key: Arc<dyn HeaderKey> = Arc::from(mem::replace(
+                    &mut keys.header.local,
+                    Box::new(crypto::TakenKey),
+                ));
+                keys.header.local = Box::new(key.clone());
+                key
+            })
+            .clone();
+        let packet = self
+            .shared_local_packet
+            .get_or_insert_with(|| {
+                let key: Arc<dyn PacketKey> = Arc::from(mem::replace(
+                    &mut keys.packet.local,
+                    Box::new(crypto::TakenKey),
+                ));
+                keys.packet.local = Box::new(key.clone());
+                key
+            })
+            .clone();
+        (header, packet)
     }
 
     /// Override how many packets the first key phase lasts
@@ -453,6 +494,7 @@ impl CryptoState {
             update_unacked: remote,
         });
 
+        self.shared_local_packet = None;
         self.key_phase_size = confidentiality_limit.saturating_sub(KEY_UPDATE_MARGIN);
         self.key_phase = !self.key_phase;
         self.spaces[2].sent_with_keys = 0;

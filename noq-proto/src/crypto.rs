@@ -8,7 +8,7 @@
 //! Note that usage of any protocol (version) other than TLS 1.3 does not conform to any
 //! published versions of the specification, and will not be supported in QUIC v1.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{any::Any, str};
 
 use bytes::BytesMut;
@@ -183,6 +183,131 @@ pub trait HeaderKey: Send + Sync {
     fn encrypt(&self, pn_offset: usize, packet: &mut [u8]);
     /// The sample size used for this key's algorithm
     fn sample_size(&self) -> usize;
+}
+
+impl PacketKey for Arc<dyn PacketKey> {
+    fn encrypt(&self, path_id: PathId, packet: u64, buf: &mut [u8], header_len: usize) {
+        (**self).encrypt(path_id, packet, buf, header_len)
+    }
+
+    fn decrypt(
+        &self,
+        path_id: PathId,
+        packet: u64,
+        header: &[u8],
+        payload: &mut BytesMut,
+    ) -> Result<(), CryptoError> {
+        (**self).decrypt(path_id, packet, header, payload)
+    }
+
+    fn tag_len(&self) -> usize {
+        (**self).tag_len()
+    }
+
+    fn confidentiality_limit(&self) -> u64 {
+        (**self).confidentiality_limit()
+    }
+
+    fn integrity_limit(&self) -> u64 {
+        (**self).integrity_limit()
+    }
+}
+
+impl HeaderKey for Arc<dyn HeaderKey> {
+    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+        (**self).decrypt(pn_offset, packet)
+    }
+
+    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+        (**self).encrypt(pn_offset, packet)
+    }
+
+    fn sample_size(&self) -> usize {
+        (**self).sample_size()
+    }
+}
+
+/// Stands in for a key for the moment it is moved into a shared handle
+pub(crate) struct TakenKey;
+
+impl PacketKey for TakenKey {
+    fn encrypt(&self, _: PathId, _: u64, _: &mut [u8], _: usize) {
+        unreachable!("placeholder key")
+    }
+
+    fn decrypt(&self, _: PathId, _: u64, _: &[u8], _: &mut BytesMut) -> Result<(), CryptoError> {
+        unreachable!("placeholder key")
+    }
+
+    fn tag_len(&self) -> usize {
+        unreachable!("placeholder key")
+    }
+
+    fn confidentiality_limit(&self) -> u64 {
+        unreachable!("placeholder key")
+    }
+
+    fn integrity_limit(&self) -> u64 {
+        unreachable!("placeholder key")
+    }
+}
+
+impl HeaderKey for TakenKey {
+    fn decrypt(&self, _: usize, _: &mut [u8]) {
+        unreachable!("placeholder key")
+    }
+
+    fn encrypt(&self, _: usize, _: &mut [u8]) {
+        unreachable!("placeholder key")
+    }
+
+    fn sample_size(&self) -> usize {
+        unreachable!("placeholder key")
+    }
+}
+
+/// A 1-RTT packet written to a transmit buffer in the clear, and what protects it
+///
+/// With [`Connection::set_deferred_seal`] a connection leaves the protection of its 1-RTT
+/// packets to the caller, which applies it with [`Self::seal`] before sending the buffer.
+/// That lets the cost of encryption leave the critical section the connection is driven in.
+///
+/// [`Connection::set_deferred_seal`]: crate::Connection::set_deferred_seal
+pub struct DeferredSeal {
+    /// Where the packet starts in the transmit buffer
+    pub(crate) start: usize,
+    /// Where the packet ends, authentication tag included
+    pub(crate) end: usize,
+    pub(crate) header_len: usize,
+    /// Offset of the packet number from the start of the packet
+    pub(crate) pn_pos: usize,
+    pub(crate) packet_number: u64,
+    pub(crate) path_id: PathId,
+    pub(crate) header_key: Arc<dyn HeaderKey>,
+    pub(crate) packet_key: Arc<dyn PacketKey>,
+}
+
+impl DeferredSeal {
+    /// Protect the packet in place
+    ///
+    /// `buf` is the buffer the transmit holding this packet was written to.
+    pub fn seal(&self, buf: &mut [u8]) {
+        let packet = &mut buf[self.start..self.end];
+        self.packet_key
+            .encrypt(self.path_id, self.packet_number, packet, self.header_len);
+        self.header_key.encrypt(self.pn_pos, packet);
+    }
+}
+
+impl core::fmt::Debug for DeferredSeal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeferredSeal")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("packet_number", &self.packet_number)
+            .field("path_id", &self.path_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A key for signing with HMAC-based algorithms

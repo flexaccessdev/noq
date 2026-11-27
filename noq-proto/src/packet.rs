@@ -548,6 +548,23 @@ impl PartialEncode {
         header_crypto.encrypt(pn_pos, buf);
     }
 
+    /// Finishes the header of a packet whose protection is applied later
+    ///
+    /// Returns the header length and the offset of the packet number, which the deferred
+    /// protection needs, or `None` for a header without a packet number.
+    pub(crate) fn finish_unprotected(self, buf: &mut [u8]) -> Option<(usize, usize)> {
+        let Self { header_len, pn, .. } = self;
+        let (pn_len, write_len) = pn?;
+        let pn_pos = header_len - pn_len;
+        if write_len {
+            let len = buf.len() - header_len + pn_len;
+            assert!(len < 2usize.pow(14)); // Fits in reserved space
+            let mut slice = &mut buf[pn_pos - 2..pn_pos];
+            slice.put_u16(len as u16 | (0b01 << 14));
+        }
+        Some((header_len, pn_pos))
+    }
+
     /// Creates a [`PartialEncode`] that has not encoded a header into the buffer.
     ///
     /// This is used exclusively for testing as such a type is otherwise invalid.

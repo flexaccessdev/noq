@@ -1378,6 +1378,59 @@ fn key_update_simple() {
     );
 }
 
+/// Packets a connection leaves for its caller to protect are accepted by the
+/// peer, with the keys of the phase they were built in.
+#[test]
+fn deferred_seal_across_key_update() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.client.deferred_seal = true;
+    pair.server.deferred_seal = true;
+    let (client_ch, server_ch) = pair.connect();
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+
+    for round in 0..3u8 {
+        let data = Bytes::from(vec![round; 900]);
+        let batch = vec![data.clone(); 8];
+        let sealed = (pair.client.deferred_sealed, pair.server.deferred_sealed);
+        assert_eq!(
+            pair.client_datagrams(client_ch).send_many(&batch, true),
+            Ok(batch.len())
+        );
+        pair.server_datagrams(server_ch)
+            .send(data.clone(), true)
+            .unwrap();
+        pair.drive();
+
+        assert!(pair.client.deferred_sealed >= sealed.0 + batch.len());
+        assert!(pair.server.deferred_sealed > sealed.1);
+        assert_matches!(
+            pair.server_conn_mut(server_ch).poll(),
+            Some(Event::DatagramReceived)
+        );
+        for _ in 0..batch.len() {
+            assert_eq!(pair.server_datagrams(server_ch).recv(), Some(data.clone()));
+        }
+        assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+        assert_matches!(
+            pair.client_conn_mut(client_ch).poll(),
+            Some(Event::DatagramReceived)
+        );
+        assert_eq!(pair.client_datagrams(client_ch).recv(), Some(data));
+
+        // The next round's packets are built with new keys, one side at a time.
+        match round {
+            0 => pair.client_conn_mut(client_ch).force_key_update(),
+            _ => pair.server_conn_mut(server_ch).force_key_update(),
+        }
+    }
+
+    let client = pair.client_conn_mut(client_ch).path_stats(PathId::ZERO);
+    assert_eq!(client.unwrap().lost_packets, 0);
+    let server = pair.server_conn_mut(server_ch).path_stats(PathId::ZERO);
+    assert_eq!(server.unwrap().lost_packets, 0);
+}
+
 #[test]
 fn key_update_reordered() {
     let _guard = subscribe();

@@ -1168,6 +1168,11 @@ pub(super) struct TestEndpoint {
     #[debug("handle_incoming")]
     pub(super) handle_incoming: Box<dyn FnMut(&Incoming) -> IncomingConnectionBehavior>,
     pub(super) waiting_incoming: Vec<Incoming>,
+    /// Whether connections leave the protection of their 1-RTT packets to
+    /// [`Self::drive_outgoing`], see [`Connection::set_deferred_seal`].
+    pub(super) deferred_seal: bool,
+    /// How many packets [`Self::drive_outgoing`] protected itself.
+    pub(super) deferred_sealed: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1315,6 +1320,8 @@ impl TestEndpoint {
             capture_inbound_packets: false,
             handle_incoming: Box::new(|_| IncomingConnectionBehavior::Accept),
             waiting_incoming: Vec::new(),
+            deferred_seal: false,
+            deferred_sealed: 0,
         }
     }
 
@@ -1380,6 +1387,7 @@ impl TestEndpoint {
     pub(super) fn drive_outgoing(&mut self, now: Instant) {
         let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
         let mut buf = Vec::with_capacity(buffer_size);
+        let mut seals = Vec::new();
 
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
@@ -1398,7 +1406,13 @@ impl TestEndpoint {
                 while let Some(event) = conn.poll_endpoint_events() {
                     endpoint_events.push((*ch, event));
                 }
+                conn.set_deferred_seal(self.deferred_seal);
                 while let Some(transmit) = conn.poll_transmit(now, MAX_DATAGRAMS, &mut buf) {
+                    conn.take_deferred_seals(&mut seals);
+                    self.deferred_sealed += seals.len();
+                    for seal in seals.drain(..) {
+                        seal.seal(&mut buf);
+                    }
                     let size = transmit.size;
                     self.outbound.extend(split_transmit(transmit, &buf[..size]));
                     buf.clear();
