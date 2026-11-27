@@ -27,6 +27,7 @@ use crate::{
     path::{OpenPath, PathRef, PathRefOwner},
     recv_stream::RecvStream,
     runtime::{AsyncTimer, Runtime, UdpSender},
+    send_pipe::{SendJob, SendPipe},
     send_stream::SendStream,
     udp_transmit,
 };
@@ -56,6 +57,16 @@ impl Connecting {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
 
+        // A second task pays when a transmit is a batch: with one datagram per
+        // transmit it is woken per packet, see `SEND_PIPELINED`.
+        let (sender, pipe) = match SEND_PIPELINED && sender.max_transmit_segments().get() > 1 {
+            true => {
+                let (pipe, task) = SendPipe::new(sender);
+                runtime.spawn(Box::pin(task.instrument(Span::current())));
+                (Box::pin(TakenSender) as Pin<Box<dyn UdpSender>>, Some(pipe))
+            }
+            false => (sender, None),
+        };
         let conn = ConnectionRef(Arc::new(Arc::new(ConnectionInner {
             state: Mutex::new(State::new(
                 conn,
@@ -65,6 +76,7 @@ impl Connecting {
                 on_handshake_data_send,
                 on_connected_send,
                 sender,
+                pipe,
                 runtime.clone(),
             )),
             shared: Shared::default(),
@@ -270,21 +282,27 @@ impl Future for ConnectionDriver {
             return Poll::Ready(Ok(()));
         }
 
-        // Transmit with the connection unlocked across each socket send. The
-        // send is a syscall per transmit, the slowest step of the loop, and
-        // holding the lock across it makes every task that queues data for
-        // this connection wait out the sends of what it queued before. Only
-        // this task touches the sender, the send buffer and the buffered
-        // transmit, so they leave the state for the duration of the send.
-        // Not on Windows, see `SEND_UNLOCKED`.
+        // A connection with a sending task only queues its transmits here, see
+        // `SEND_PIPELINED`. Without one, transmit with the connection unlocked
+        // across each socket send. The send is a syscall per transmit, the
+        // slowest step of the loop, and holding the lock across it makes every
+        // task that queues data for this connection wait out the sends of what
+        // it queued before. Only this task touches the sender, the send buffer
+        // and the buffered transmit, so they leave the state for the duration
+        // of the send. Not on Windows, see `SEND_UNLOCKED`.
         let mut keep_going = false;
         let now = conn.runtime.now();
-        let max_datagrams = conn
-            .sender
-            .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
+        let max_datagrams = conn.max_transmit_segments().min(MAX_TRANSMIT_SEGMENTS);
         let mut transmits = 0;
-        while let Some(t) = conn.next_transmit(now, max_datagrams, &mut transmits) {
+        if conn.pipe.is_some() {
+            match conn.queue_transmits(now, max_datagrams, cx) {
+                Ok(more) => keep_going = more,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+        while conn.pipe.is_none()
+            && let Some(t) = conn.next_transmit(now, max_datagrams, &mut transmits)
+        {
             let result = if SEND_UNLOCKED {
                 let (mut sender, buffer) = conn.take_sender();
                 drop(conn);
@@ -336,6 +354,17 @@ impl Future for ConnectionDriver {
     }
 }
 
+/// The sending task goes with the driver. Nothing queues a transmit once the
+/// driver is done, and the state can outlast it by far: a [`Connection`]
+/// handle kept for its final statistics must not keep the sender, and what it
+/// has queued, alive.
+impl Drop for ConnectionDriver {
+    fn drop(&mut self) {
+        let pipe = self.0.lock_without_waking("drop driver").pipe.take();
+        drop(pipe);
+    }
+}
+
 /// Stands in for a connection's sender while the driver sends with the state
 /// unlocked. Nothing but the driver uses the sender, so it is never polled.
 #[derive(Debug)]
@@ -373,6 +402,12 @@ impl Connection {
     /// Returns a weak reference to the inner connection struct.
     pub fn weak_handle(&self) -> WeakConnectionHandle {
         self.0.weak_handle()
+    }
+
+    /// Whether a task of its own sends this connection's transmits right now.
+    #[cfg(test)]
+    pub(crate) fn has_send_pipe(&self) -> bool {
+        self.0.lock_without_waking("has_send_pipe").pipe.is_some()
     }
 
     /// Initiate a new outgoing unidirectional stream.
@@ -809,10 +844,7 @@ impl Connection {
     ///
     /// [`send_many_datagrams()`]: Connection::send_many_datagrams
     /// [`send_datagram_wait()`]: Connection::send_datagram_wait
-    pub fn try_send_many_datagrams(
-        &self,
-        datagrams: &[Bytes],
-    ) -> Result<usize, SendDatagramError> {
+    pub fn try_send_many_datagrams(&self, datagrams: &[Bytes]) -> Result<usize, SendDatagramError> {
         let conn = &mut *self.0.lock_and_wake("try_send_many_datagrams");
         if let Some(ref x) = conn.error {
             return Err(SendDatagramError::ConnectionLost(x.clone()));
@@ -1672,6 +1704,9 @@ pub(crate) struct State {
     pub(crate) final_path_stats: FxHashMap<PathId, PathStats>,
     pub(crate) path_events: tokio::sync::broadcast::Sender<PathEvent>,
     sender: Pin<Box<dyn UdpSender>>,
+    /// The queue to the task that protects and sends this connection's
+    /// transmits, which then holds the sender. See [`SEND_PIPELINED`].
+    pipe: Option<SendPipe>,
     pub(crate) runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
@@ -1693,8 +1728,11 @@ impl State {
         on_handshake_data: oneshot::Sender<()>,
         on_connected: oneshot::Sender<bool>,
         sender: Pin<Box<dyn UdpSender>>,
+        pipe: Option<SendPipe>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
+        let mut inner = inner;
+        inner.set_deferred_seal(pipe.is_some());
         Self {
             inner,
             driver: None,
@@ -1713,6 +1751,7 @@ impl State {
             open_path: FxHashMap::default(),
             error: None,
             sender,
+            pipe,
             runtime,
             send_buffer: Vec::new(),
             buffered_transmit: None,
@@ -1722,6 +1761,16 @@ impl State {
             on_closed: Vec::new(),
             final_path_stats: Default::default(),
             path_refs: Default::default(),
+        }
+    }
+
+    /// How many datagrams the sender takes in one transmit right now. A socket
+    /// lowers it when the kernel refuses a batch, so it is asked for every
+    /// poll: the sending task answers for a sender it holds.
+    fn max_transmit_segments(&self) -> NonZeroUsize {
+        match &self.pipe {
+            Some(pipe) => pipe.max_segments(),
+            None => self.sender.max_transmit_segments(),
         }
     }
 
@@ -1746,6 +1795,43 @@ impl State {
             Some(s) => t.size.div_ceil(s), // round up
         };
         Some(t)
+    }
+
+    /// Build transmits and queue them for the sending task, until there is
+    /// nothing to send, the queue is full or this poll's share is used up.
+    /// Returns whether the driver has more to do right away.
+    fn queue_transmits(
+        &mut self,
+        now: Instant,
+        max_datagrams: NonZeroUsize,
+        cx: &mut Context<'_>,
+    ) -> io::Result<bool> {
+        let pipe = self.pipe.as_ref().expect("checked by the caller");
+        let mut transmits = 0;
+        loop {
+            let (mut buffer, mut seals) = match pipe.poll_ready(cx) {
+                Poll::Ready(buffers) => buffers?,
+                Poll::Pending => return Ok(false),
+            };
+            buffer.clear();
+            let Some(transmit) = self.inner.poll_transmit(now, max_datagrams, &mut buffer) else {
+                pipe.give_back(buffer, seals);
+                return Ok(false);
+            };
+            self.inner.take_deferred_seals(&mut seals);
+            transmits += match transmit.segment_size {
+                None => 1,
+                Some(s) => transmit.size.div_ceil(s), // round up
+            };
+            pipe.send(SendJob {
+                transmit,
+                buffer,
+                seals,
+            });
+            if transmits >= MAX_TRANSMIT_DATAGRAMS {
+                return Ok(true);
+            }
+        }
     }
 
     /// Send a transmit built into the send buffer without leaving the state.
@@ -1783,7 +1869,10 @@ impl State {
         loop {
             match self.conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(sender))) => {
-                    self.sender = sender;
+                    match &self.pipe {
+                        Some(pipe) => pipe.rebind(sender),
+                        None => self.sender = sender,
+                    }
                     self.inner.handle_network_change(None, self.runtime.now());
                 }
                 Poll::Ready(Some(ConnectionEvent::LocalAddressChanged(hint))) => {
@@ -2126,6 +2215,19 @@ pub enum SendDatagramError {
 /// the lock is held across the send as upstream does. Between Linux hosts
 /// both measured alike.
 const SEND_UNLOCKED: bool = !cfg!(windows);
+
+/// Whether a connection's transmits are protected and sent by a task of
+/// their own, see [`crate::send_pipe`].
+///
+/// Only for a sender that takes several datagrams per transmit, as decided
+/// when the connection is made. Each transmit is a hand-over between two
+/// tasks, which a batch of 32 shares and a single datagram pays alone: on
+/// macOS, where a transmit is one datagram, a tunnel client's upload fell
+/// from about 900 to 510 Mbit/s with the second task.
+///
+/// Not on Windows, where the driver sends with the lock held, see
+/// [`SEND_UNLOCKED`].
+const SEND_PIPELINED: bool = SEND_UNLOCKED;
 
 /// The maximum amount of datagrams which will be produced in a single `drive_transmit` call
 ///

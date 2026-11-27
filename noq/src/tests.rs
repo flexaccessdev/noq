@@ -21,7 +21,7 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use crate::runtime::{AsyncTimer, AsyncUdpSocket, TokioRuntime};
+use crate::runtime::{AsyncTimer, AsyncUdpSocket, TokioRuntime, UdpSender};
 use crate::{Duration, Instant};
 use bytes::Bytes;
 use proto::{
@@ -343,6 +343,17 @@ impl EndpointFactory {
         transport_config: TransportConfig,
         runtime: Arc<dyn crate::runtime::Runtime>,
     ) -> Endpoint {
+        self.endpoint_with_socket(name, transport_config, runtime, |socket| socket)
+    }
+
+    /// An endpoint on the runtime's socket as `wrap` hands it back
+    fn endpoint_with_socket(
+        &self,
+        name: impl Into<String>,
+        transport_config: TransportConfig,
+        runtime: Arc<dyn crate::runtime::Runtime>,
+        wrap: impl FnOnce(Box<dyn AsyncUdpSocket>) -> Box<dyn AsyncUdpSocket>,
+    ) -> Endpoint {
         let span = info_span!("dummy");
         span.record("otel.name", name.into());
         let _guard = span.entered();
@@ -354,10 +365,15 @@ impl EndpointFactory {
 
         let mut roots = RootCertStore::empty();
         roots.add(self.cert.cert.der().clone()).unwrap();
-        let endpoint = Endpoint::new(
+        let socket = runtime
+            .wrap_udp_socket(
+                UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+            )
+            .unwrap();
+        let endpoint = Endpoint::new_with_abstract_socket(
             self.endpoint_config.clone(),
             Some(server_config),
-            UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+            wrap(socket),
             runtime,
         )
         .unwrap();
@@ -366,6 +382,83 @@ impl EndpointFactory {
         endpoint.set_default_client_config(client_config);
 
         endpoint
+    }
+}
+
+/// A socket whose senders take two datagrams per transmit on any host: they
+/// send each on its own, so it does not take UDP segmentation offload.
+#[derive(Debug)]
+struct BatchingSocket(Box<dyn AsyncUdpSocket>);
+
+impl AsyncUdpSocket for BatchingSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(BatchingSender {
+            inner: self.0.create_sender(),
+            sent: 0,
+        })
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.0.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+
+    fn max_receive_segments(&self) -> std::num::NonZeroUsize {
+        self.0.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.0.may_fragment()
+    }
+}
+
+#[derive(Debug)]
+struct BatchingSender {
+    inner: Pin<Box<dyn UdpSender>>,
+    /// How much of the transmit in hand has been sent
+    sent: usize,
+}
+
+impl UdpSender for BatchingSender {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        transmit: &udp::Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let all = transmit.contents;
+        let segment = transmit.segment_size.unwrap_or(all.len()).max(1);
+        while self.sent < all.len() {
+            let end = (self.sent + segment).min(all.len());
+            let one = udp::Transmit {
+                destination: transmit.destination,
+                ecn: transmit.ecn,
+                contents: &all[self.sent..end],
+                segment_size: None,
+                src_ip: transmit.src_ip,
+            };
+            match self.inner.as_mut().poll_send(&one, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => self.sent = end,
+                Poll::Ready(Err(e)) => {
+                    self.sent = 0;
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
+        self.sent = 0;
+        Poll::Ready(Ok(()))
+    }
+
+    fn max_transmit_segments(&self) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(2).unwrap()
     }
 }
 
@@ -1311,6 +1404,46 @@ async fn dropped_connection_cleans_up() {
         async { endpoint.accept().await.unwrap().await.unwrap() }
     );
     endpoint.wait_all_draining().await;
+}
+
+/// A connection handle that outlives the driver does not keep the sending
+/// task, and with it the sender, alive.
+#[tokio::test]
+async fn send_task_ends_with_the_driver() {
+    let _guard = subscribe();
+    // A sender that takes batches wherever the test runs: whether the host's
+    // own socket does depends on its UDP segmentation offload.
+    let endpoint = EndpointFactory::new().endpoint_with_socket(
+        "ep",
+        TransportConfig::default(),
+        Arc::new(TokioRuntime),
+        |socket| Box::new(BatchingSocket(socket)),
+    );
+    let (client, server) = tokio::join!(
+        async {
+            endpoint
+                .connect(endpoint.local_addr().unwrap(), "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        async { endpoint.accept().await.unwrap().await.unwrap() }
+    );
+    // Windows sends from the driver, see `SEND_UNLOCKED`.
+    assert_eq!(client.has_send_pipe(), !cfg!(windows));
+    assert_eq!(server.has_send_pipe(), !cfg!(windows));
+
+    client.close(0u32.into(), b"done");
+    server.closed().await;
+    endpoint.wait_idle().await;
+    // The drivers are done: give the runtime a moment to drop them.
+    for _ in 0..200 {
+        if !client.has_send_pipe() && !server.has_send_pipe() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!client.has_send_pipe() && !server.has_send_pipe());
 }
 
 /// Test that accessing stats from `Path` works as expected.

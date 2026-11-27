@@ -50,6 +50,7 @@ mod mutex;
 mod path;
 mod recv_stream;
 mod runtime;
+mod send_pipe;
 mod send_stream;
 mod work_limiter;
 
